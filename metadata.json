@@ -1,0 +1,6 @@
+{
+  "name": "DLON.io",
+  "description": "A highly polished, premium landing site for DLON.io, featuring interactive technology solution builders, custom tech stack recommendations, project cost estimators, and an AI consulting interface for entrepreneurs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
