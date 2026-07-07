@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -153,13 +154,218 @@ Analyze this concept and provide a comprehensive, realistic technical proposal i
   }
 });
 
-// Lead capture / waitlist endpoint (simulated database storage in memory)
-const leads: any[] = [];
-app.post("/api/leads", (req, res) => {
+// Persistent file-based local database
+interface DBState {
+  leads: any[];
+  spreadsheetId: string | null;
+  spreadsheetName: string | null;
+  accessToken: string | null;
+}
+
+const DB_FILE = path.join(process.cwd(), "leads_db.json");
+
+function loadDB(): DBState {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const data = fs.readFileSync(DB_FILE, "utf-8");
+      return JSON.parse(data);
+    }
+  } catch (e) {
+    console.error("Failed to load leads_db.json:", e);
+  }
+  return { leads: [], spreadsheetId: null, spreadsheetName: null, accessToken: null };
+}
+
+function saveDB(state: DBState) {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(state, null, 2), "utf-8");
+  } catch (e) {
+    console.error("Failed to save leads_db.json:", e);
+  }
+}
+
+// Google Sheets API Helpers
+async function createSpreadsheet(accessToken: string): Promise<{ id: string; name: string }> {
+  const url = "https://sheets.googleapis.com/v4/spreadsheets";
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      properties: {
+        title: "DLOn.io Contact Leads"
+      }
+    })
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Failed to create Google Sheet: ${errText}`);
+  }
+
+  const data = await res.json() as any;
+  const spreadsheetId = data.spreadsheetId;
+
+  // Initialize Sheet headers
+  const headerUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/Sheet1!A1:F1?valueInputOption=RAW`;
+  const headerRes = await fetch(headerUrl, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      values: [
+        ["Timestamp", "Name", "Email", "Company", "Message / System Concept", "Submission Type"]
+      ]
+    })
+  });
+
+  if (!headerRes.ok) {
+    console.error("Failed to write spreadsheet headers:", await headerRes.text());
+  }
+
+  return { id: spreadsheetId, name: "DLOn.io Contact Leads" };
+}
+
+async function appendLeadToSheet(spreadsheetId: string, accessToken: string, lead: any) {
+  const range = "Sheet1!A:F";
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=RAW`;
+  
+  const leadMsg = lead.message || (lead.proposalData ? `Blueprint Proposal Context: ${lead.proposalData.architectureSummary}` : "");
+  const values = [
+    [
+      lead.createdAt,
+      lead.name,
+      lead.email,
+      lead.company,
+      leadMsg,
+      lead.proposalData ? "AI Architect Proposal" : "Contact Inquiry"
+    ]
+  ];
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ values })
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Google Sheets API Error: ${errorText}`);
+  }
+
+  return await res.json();
+}
+
+// Sheets integration and lead capture endpoints
+app.get("/api/sheets/status", (req, res) => {
+  const db = loadDB();
+  const unsyncedCount = db.leads.filter(l => !l.synced).length;
+  res.json({
+    spreadsheetId: db.spreadsheetId,
+    spreadsheetName: db.spreadsheetName,
+    hasToken: !!db.accessToken,
+    totalLeads: db.leads.length,
+    unsyncedLeads: unsyncedCount,
+    leads: db.leads
+  });
+});
+
+app.post("/api/sheets/token", (req, res) => {
+  const { accessToken } = req.body;
+  if (!accessToken) {
+    return res.status(400).json({ error: "Access token is required" });
+  }
+
+  const db = loadDB();
+  db.accessToken = accessToken;
+  saveDB(db);
+  res.json({ success: true, message: "Server Google Sheets access token updated." });
+});
+
+app.post("/api/sheets/config", async (req, res) => {
+  const { accessToken, spreadsheetId } = req.body;
+  const tokenToUse = accessToken || loadDB().accessToken;
+
+  if (!tokenToUse) {
+    return res.status(400).json({ error: "Google OAuth Access Token is required to configure Sheets." });
+  }
+
+  const db = loadDB();
+  db.accessToken = tokenToUse;
+
+  try {
+    if (spreadsheetId) {
+      db.spreadsheetId = spreadsheetId;
+      db.spreadsheetName = "Linked Custom Spreadsheet";
+    } else {
+      // Create a brand new Google Sheet
+      const sheet = await createSpreadsheet(tokenToUse);
+      db.spreadsheetId = sheet.id;
+      db.spreadsheetName = sheet.name;
+    }
+    saveDB(db);
+    res.json({
+      success: true,
+      spreadsheetId: db.spreadsheetId,
+      spreadsheetName: db.spreadsheetName
+    });
+  } catch (error: any) {
+    console.error("Sheets config failed:", error);
+    res.status(500).json({ error: error.message || "Failed to configure Google Sheet." });
+  }
+});
+
+app.post("/api/sheets/sync", async (req, res) => {
+  const { accessToken } = req.body;
+  const db = loadDB();
+  const tokenToUse = accessToken || db.accessToken;
+
+  if (!tokenToUse) {
+    return res.status(400).json({ error: "Access token is required to synchronize." });
+  }
+  if (!db.spreadsheetId) {
+    return res.status(400).json({ error: "No active Google Sheet configured." });
+  }
+
+  db.accessToken = tokenToUse;
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const lead of db.leads) {
+    if (!lead.synced) {
+      try {
+        await appendLeadToSheet(db.spreadsheetId, tokenToUse, lead);
+        lead.synced = true;
+        successCount++;
+      } catch (err) {
+        console.error(`Failed to sync lead ${lead.id}:`, err);
+        failCount++;
+      }
+    }
+  }
+
+  saveDB(db);
+  res.json({
+    success: true,
+    syncedCount: successCount,
+    failedCount: failCount,
+    totalLeads: db.leads.length
+  });
+});
+
+app.post("/api/leads", async (req, res) => {
   const { name, email, company, message, proposalData } = req.body;
   if (!email) {
     return res.status(400).json({ error: "Email is required" });
   }
+
   const lead = {
     id: `lead_${Date.now()}`,
     name: name || "Anonymous",
@@ -167,11 +373,38 @@ app.post("/api/leads", (req, res) => {
     company: company || "Freelancer / Founder",
     message: message || "",
     proposalData: proposalData || null,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    synced: false
   };
-  leads.push(lead);
+
+  const db = loadDB();
+  db.leads.push(lead);
+  saveDB(db);
+
+  // Attempt automatic sync if Google Sheet is configured and we have an access token
+  if (db.spreadsheetId && db.accessToken) {
+    try {
+      await appendLeadToSheet(db.spreadsheetId, db.accessToken, lead);
+      // Mark as synced if sheets append succeeds
+      const currentDB = loadDB();
+      const storedLead = currentDB.leads.find(l => l.id === lead.id);
+      if (storedLead) {
+        storedLead.synced = true;
+        saveDB(currentDB);
+      }
+      lead.synced = true;
+      console.log("Lead successfully auto-synced to Google Sheets:", lead.id);
+    } catch (err) {
+      console.warn("Auto-sync failed, lead saved locally for manual sync:", err);
+    }
+  }
+
   console.log("New lead registered successfully:", lead);
-  return res.json({ success: true, message: "Lead captured successfully!" });
+  return res.json({
+    success: true,
+    message: "Lead captured successfully!",
+    synced: lead.synced
+  });
 });
 
 // Vite middleware for development / Static assets for production

@@ -4,6 +4,7 @@ import { SolutionsGrid } from "./components/SolutionsGrid";
 import { InteractiveArchitect } from "./components/InteractiveArchitect";
 import { ProcessTimeline } from "./components/ProcessTimeline";
 import { ContactForm } from "./components/ContactForm";
+import { SheetsAdmin } from "./components/SheetsAdmin";
 import { Cpu, ChevronRight, Terminal, Shield, Sparkles, Layers, ArrowRight } from "lucide-react";
 import { motion } from "motion/react";
 
@@ -240,6 +241,9 @@ export default function App() {
 
       {/* Standalone contact brief form */}
       <ContactForm />
+
+      {/* Google Sheets Integration Panel */}
+      <SheetsAdmin />
 
       {/* Elegant Footer matching the lockup style of the brand */}
       <footer className="py-20 border-t border-white/10 bg-[#0F0F0F] relative xl:px-20">
